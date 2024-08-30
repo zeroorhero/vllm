@@ -223,7 +223,8 @@ class LLMEngine:
             "decoding_config=%r, observability_config=%r, "
             "seed=%d, served_model_name=%s, use_v2_block_manager=%s, "
             "num_scheduler_steps=%d, enable_prefix_caching=%s, "
-            "use_async_output_proc=%s)",
+            "use_async_output_proc=%s, external_swapper=%s, "
+            "external_swapper_space=%d)",
             VLLM_VERSION,
             model_config.model,
             speculative_config,
@@ -255,6 +256,8 @@ class LLMEngine:
             scheduler_config.num_scheduler_steps,
             cache_config.enable_prefix_caching,
             model_config.use_async_output_proc,
+            cache_config.external_swapper,
+            cache_config.external_swapper_space_bytes,
         )
         # TODO(woosuk): Print more configs in debug mode.
         from vllm.plugins import load_general_plugins
@@ -312,6 +315,8 @@ class LLMEngine:
             observability_config=self.observability_config,
         )
 
+        self.enable_external_swapper = (self.cache_config.external_swapper !=
+                                        "")
         if not self.model_config.embedding_mode:
             self._initialize_kv_caches()
 
@@ -458,10 +463,18 @@ class LLMEngine:
                 num_gpu_blocks_override)
             num_gpu_blocks = num_gpu_blocks_override
 
+        if self.enable_external_swapper:
+            self._initialize_external_caches()
+
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
         self.model_executor.initialize_cache(num_gpu_blocks, num_cpu_blocks)
+
+    def _initialize_external_caches(self) -> None:
+        blocks = self.model_executor.determine_num_external_available_blocks()
+        self.cache_config.num_external_blocks = blocks
+        self.model_executor.initialize_external_cache(blocks)
 
     @classmethod
     def _get_executor_cls(cls,
@@ -1741,6 +1754,8 @@ class LLMEngine:
             len(scheduler.swapped) for scheduler in self.scheduler)
         num_waiting_sys = sum(
             len(scheduler.waiting) for scheduler in self.scheduler)
+        num_cumulative_preemption = sum(scheduler.num_cumulative_preemption
+                                        for scheduler in self.scheduler)
 
         # KV Cache Usage in %
         num_total_gpu = self.cache_config.num_gpu_blocks
@@ -1758,6 +1773,15 @@ class LLMEngine:
                 scheduler.block_manager.get_num_free_cpu_blocks()
                 for scheduler in self.scheduler)
             cpu_cache_usage_sys = 1.0 - (num_free_cpu / num_total_cpu)
+
+        num_total_external = self.cache_config.num_external_blocks
+        external_cache_usage_sys = 0.
+        if num_total_external is not None and num_total_external > 0:
+            num_free_external = sum(
+                scheduler.block_manager.get_num_free_external_blocks()
+                for scheduler in self.scheduler)
+            external_cache_usage_sys = 1.0 - (num_free_external /
+                                              num_total_external)
 
         # Prefix Cache Hit Rate. Note that we always use
         # the cache hit rate of the first virtual engine.
@@ -1879,9 +1903,11 @@ class LLMEngine:
             num_running_sys=num_running_sys,
             num_swapped_sys=num_swapped_sys,
             num_waiting_sys=num_waiting_sys,
+            num_cumulative_preemption=num_cumulative_preemption,
             #   KV Cache Usage in %
             gpu_cache_usage_sys=gpu_cache_usage_sys,
             cpu_cache_usage_sys=cpu_cache_usage_sys,
+            external_cache_usage_sys=external_cache_usage_sys,
             #   Prefix Cache Hit Rate
             cpu_prefix_cache_hit_rate=cpu_prefix_cache_hit_rate,
             gpu_prefix_cache_hit_rate=gpu_prefix_cache_hit_rate,
